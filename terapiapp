@@ -1,0 +1,365 @@
+<?php
+
+// =====================================================
+// api.php - Puente entre la página (index.html) y MySQL
+//
+// La página llama: api.php?accion=NOMBRE (POST con JSON)
+// y recibe: { ok, mensaje, error, datos }
+// "datos" trae solo lo que el usuario que inició sesión puede ver.
+// =====================================================
+
+ini_set('display_errors', 0); // los errores se devuelven como JSON
+header('Content-Type: application/json; charset=utf-8');
+
+// Cualquier error inesperado se responde en JSON (y no rompe la página)
+set_exception_handler(function ($ex) {
+http_response_code(500);
+$mensaje = $ex instanceof PDOException
+? 'No se pudo conectar o consultar MySQL. Revisa que MySQL esté encendido en XAMPP y que exista la base de datos terapiapp. (' . $ex->getMessage() . ')'
+: 'Error del servidor: ' . $ex->getMessage();
+echo json_encode(['ok' => false, 'error' => $mensaje]);
+exit;
+});
+
+require 'config.php';
+
+const ESTADOS = ['Pendiente', 'Confirmada', 'Cancelada', 'Atendida'];
+const MODALIDADES_TERAPEUTA = ['Ambas', 'Virtual', 'Presencial'];
+
+$accion = $_GET['accion'] ?? 'datos';
+
+// =====================================================
+// RESPUESTA: siempre devuelve los datos actualizados
+// =====================================================
+function responder($ok, $texto = '', $extra = []) {
+echo json_encode(array_merge([
+'ok' => $ok,
+$ok ? 'mensaje' : 'error' => $texto,
+'datos' => datos_visibles(),
+], $extra));
+exit;
+}
+
+function requerir($rol) {
+$u = usuario_actual();
+if (!$u || $u['rol'] !== $rol) responder(false, 'Tu sesión terminó o no tienes permiso. Vuelve a iniciar sesión.');
+// Si el administrador lo desactivó, cerrar la sesión
+$activo = q("SELECT activo FROM usuarios WHERE id = ?", [$u['id']])->fetchColumn();
+if (!$activo) { $_SESSION = []; responder(false, 'Tu cuenta está desactivada.'); }
+return $u;
+}
+
+function mi_terapeuta($u) {
+return q("SELECT * FROM terapeutas WHERE id_usuario = ?", [$u['id']])->fetch();
+}
+function mi_paciente($u) {
+return q("SELECT * FROM pacientes WHERE id_usuario = ?", [$u['id']])->fetch();
+}
+
+// Convierte números y booleanos que MySQL devuelve como texto
+function limpiar($filas, $numeros = [], $booleanos = []) {
+foreach ($filas as &$f) {
+foreach ($numeros as $c) if (array_key_exists($c, $f) && $f[$c] !== null) $f[$c] = (int)$f[$c];
+foreach ($booleanos as $c) if (array_key_exists($c, $f)) $f[$c] = (bool)$f[$c];
+if (isset($f['hora'])) $f['hora'] = substr($f['hora'], 0, 5);
+foreach (['motivo', 'enlace'] as $c) if (array_key_exists($c, $f) && $f[$c] === null) $f[$c] = '';
+}
+return $filas;
+}
+
+// Consultas con los nombres de campo que usa la página
+const SQL_TERAPEUTAS = "SELECT id, id_usuario AS idUsuario, id_especialidad AS idEsp, nombre, titulo, enfoque, descripcion,
+anos_experiencia AS anos, modalidad, sede, activo FROM terapeutas";
+const SQL_PACIENTES = "SELECT id, id_usuario AS idUsuario, documento, nombre, fecha_nacimiento AS fechaNac, telefono, correo, ciudad FROM pacientes";
+const SQL_CITAS = "SELECT id, id_paciente AS idPaciente, id_terapeuta AS idTerapeuta, fecha, hora, modalidad, motivo, estado,
+enlace_virtual AS enlace, creado_en AS creado FROM citas";
+
+// =====================================================
+// DATOS QUE PUEDE VER CADA ROL
+// =====================================================
+function datos_visibles() {
+$u = usuario_actual();
+$d = [
+'usuario' => $u ? ['id' => $u['id'], 'nombre' => $u['nombre'], 'correo' => $u['correo'], 'rol' => $u['rol']] : null,
+'horario' => ['inicio' => HORA_INICIO, 'fin' => HORA_FIN],
+'especialidades' => limpiar(q("SELECT id, nombre, icono, descripcion FROM especialidades ORDER BY id")->fetchAll(), ['id']),
+'resumen' => ['citasEfectivas' => (int)q("SELECT COUNT(*) FROM citas WHERE estado IN ('Confirmada','Atendida')")->fetchColumn()],
+'terapeutas' => [], 'pacientes' => [], 'citas' => [], 'notas' => [], 'usuarios' => [], 'actividad' => [],
+];
+$numT = ['id', 'idUsuario', 'idEsp', 'anos'];
+$numC = ['id', 'idPaciente', 'idTerapeuta'];
+
+if (!$u) {
+// Visitante: solo la información pública
+$d['terapeutas'] = limpiar(q(SQL_TERAPEUTAS . " WHERE activo = 1")->fetchAll(), $numT, ['activo']);
+return $d;
+}
+
+$d['terapeutas'] = limpiar(q(SQL_TERAPEUTAS)->fetchAll(), $numT, ['activo']);
+
+if ($u['rol'] === 'admin') {
+$d['pacientes'] = limpiar(q(SQL_PACIENTES)->fetchAll(), ['id', 'idUsuario']);
+$d['citas'] = limpiar(q(SQL_CITAS)->fetchAll(), $numC);
+$d['usuarios'] = limpiar(q("SELECT id, nombre, correo, rol, activo, ultimo_acceso AS ultimoAcceso, creado_en AS creado FROM usuarios")->fetchAll(), ['id'], ['activo']);
+$d['actividad'] = limpiar(q("SELECT id, id_usuario AS idUsuario, accion, detalle, creado_en AS creado FROM actividad ORDER BY id DESC LIMIT 500")->fetchAll(), ['id', 'idUsuario']);
+} elseif ($u['rol'] === 'terapeuta') {
+$t = mi_terapeuta($u);
+$idT = $t ? (int)$t['id'] : 0;
+// Solo sus citas, sus pacientes y sus notas
+$d['citas'] = limpiar(q(SQL_CITAS . " WHERE id_terapeuta = ?", [$idT])->fetchAll(), $numC);
+$d['pacientes'] = limpiar(q(SQL_PACIENTES . " WHERE id IN (SELECT id_paciente FROM citas WHERE id_terapeuta = ?)", [$idT])->fetchAll(), ['id', 'idUsuario']);
+$d['notas'] = limpiar(q("SELECT id, id_paciente AS idPaciente, id_terapeuta AS idTerapeuta, nota, creado_en AS creado FROM notas WHERE id_terapeuta = ?", [$idT])->fetchAll(), ['id', 'idPaciente', 'idTerapeuta']);
+} else {
+// Paciente: sus datos y sus citas completas; de los demás solo el horario ocupado
+$p = mi_paciente($u);
+$idP = $p ? (int)$p['id'] : 0;
+if ($p) $d['pacientes'] = limpiar(q(SQL_PACIENTES . " WHERE id = ?", [$idP])->fetchAll(), ['id', 'idUsuario']);
+$propias = limpiar(q(SQL_CITAS . " WHERE id_paciente = ?", [$idP])->fetchAll(), $numC);
+$ocupadas = limpiar(q("SELECT id, 0 AS idPaciente, id_terapeuta AS idTerapeuta, fecha, hora, '' AS modalidad, '' AS motivo,
+'Ocupado' AS estado, '' AS enlace, '' AS creado
+FROM citas WHERE id_paciente <> ? AND estado <> 'Cancelada' AND fecha >= ?",
+[$idP, date('Y-m-d', strtotime('-60 days'))])->fetchAll(), $numC);
+$d['citas'] = array_merge($propias, $ocupadas);
+}
+return $d;
+}
+
+// Protección básica: las acciones que cambian datos deben llegar como JSON por POST
+// (un formulario de otra página no puede enviar JSON a este archivo).
+$entrada = [];
+if ($accion !== 'datos') {
+if ($_SERVER['REQUEST_METHOD'] !== 'POST' || stripos($_SERVER['CONTENT_TYPE'] ?? '', 'application/json') === false) {
+responder(false, 'Solicitud no válida.');
+}
+$entrada = json_decode(file_get_contents('php://input'), true) ?: [];
+foreach ($entrada as $k => $v) {
+if (is_string($v) && !in_array($k, ['contrasena', 'contrasena2', 'clave'], true)) $entrada[$k] = trim($v);
+}
+}
+
+// =====================================================
+// ACCIONES
+// =====================================================
+switch ($accion) {
+
+// ---------- Cargar la página ----------
+case 'datos':
+echo json_encode(['ok' => true, 'datos' => datos_visibles()]);
+exit;
+
+// ---------- Iniciar sesión ----------
+case 'login': {
+$x = q("SELECT id, nombre, correo, contrasena, rol, activo FROM usuarios WHERE correo = ?", [$entrada['correo'] ?? ''])->fetch();
+if (!$x || !password_verify($entrada['contrasena'] ?? '', $x['contrasena'])) responder(false, 'Correo o contraseña incorrectos.');
+if (!$x['activo']) responder(false, 'Tu cuenta está desactivada. Comunícate con la administración.');
+session_regenerate_id(true);
+$_SESSION['usuario'] = ['id' => (int)$x['id'], 'nombre' => $x['nombre'], 'correo' => $x['correo'], 'rol' => $x['rol']];
+q("UPDATE usuarios SET ultimo_acceso = ? WHERE id = ?", [ahora(), $x['id']]);
+registrar('Inicio de sesión', ucfirst($x['rol']));
+responder(true);
+}
+
+// ---------- Crear cuenta de paciente ----------
+case 'registro': {
+$nombre = $entrada['nombre'] ?? '';
+$correo = $entrada['correo'] ?? '';
+$clave = $entrada['contrasena'] ?? '';
+if ($nombre === '' || !filter_var($correo, FILTER_VALIDATE_EMAIL)) responder(false, 'Escribe tu nombre y un correo válido.');
+if (strlen($clave) < 6) responder(false, 'La contraseña debe tener mínimo 6 caracteres.');
+if ($clave !== ($entrada['contrasena2'] ?? '')) responder(false, 'Las contraseñas no coinciden.');
+if (q("SELECT COUNT(*) FROM usuarios WHERE correo = ?", [$correo])->fetchColumn()) responder(false, 'Ya existe una cuenta con ese correo. Inicia sesión.');
+q("INSERT INTO usuarios (nombre, correo, contrasena, rol, activo, ultimo_acceso, creado_en) VALUES (?, ?, ?, 'paciente', 1, ?, ?)",
+[$nombre, $correo, password_hash($clave, PASSWORD_DEFAULT), ahora(), ahora()]);
+session_regenerate_id(true);
+$_SESSION['usuario'] = ['id' => (int)$db->lastInsertId(), 'nombre' => $nombre, 'correo' => $correo, 'rol' => 'paciente'];
+registrar('Registro', 'Nuevo paciente');
+responder(true, '¡Bienvenido(a)! Ahora llena tus datos y agenda tu cita.');
+}
+
+// ---------- Cerrar sesión ----------
+case 'salir':
+if (usuario_actual()) registrar('Cierre de sesión', ucfirst(usuario_actual()['rol']));
+$_SESSION = [];
+session_regenerate_id(true);
+responder(true);
+
+// ---------- Paciente: agendar cita ----------
+case 'agendar': {
+$u = requerir('paciente');
+$f = $entrada;
+$t = q("SELECT * FROM terapeutas WHERE id = ? AND activo = 1", [(int)($f['terapeuta'] ?? 0)])->fetch();
+$hora = $f['hora'] ?? '';
+$fecha = $f['fecha'] ?? '';
+$horaOk = preg_match('/^(\d{2}):00$/', $hora, $m) && (int)$m[1] >= HORA_INICIO && (int)$m[1] <= HORA_FIN;
+$fechaOk = preg_match('/^\d{4}-\d{2}-\d{2}$/', $fecha) && strtotime($fecha) !== false;
+
+if (empty($f['documento']) || empty($f['nombre']) || empty($f['fechaNac']) || empty($f['telefono']))
+responder(false, 'Completa tus datos personales: documento, nombre, fecha de nacimiento y teléfono.');
+if (!empty($f['correo']) && !filter_var($f['correo'], FILTER_VALIDATE_EMAIL)) responder(false, 'El correo no es válido.');
+if (!$t) responder(false, 'Elige un terapeuta.');
+if (!in_array($f['modalidad'] ?? '', ['Virtual', 'Presencial'], true)) responder(false, 'Elige si quieres la cita virtual o presencial.');
+if ($t['modalidad'] !== 'Ambas' && $t['modalidad'] !== $f['modalidad'])
+responder(false, $t['nombre'] . ' solo atiende citas ' . mb_strtolower($t['modalidad']) . 'es.');
+if (!$fechaOk || $fecha < hoy()) responder(false, 'Elige una fecha de hoy en adelante.');
+if (date('w', strtotime($fecha)) == 0) responder(false, 'Los domingos no hay atención. Elige otro día.');
+if (!$horaOk) responder(false, 'Elige una hora de la lista.');
+if ($fecha === hoy() && (int)$m[1] <= (int)date('G')) responder(false, 'Esa hora ya pasó. Elige una más tarde.');
+
+$horaSql = $hora . ':00';
+if (q("SELECT COUNT(*) FROM citas WHERE id_terapeuta = ? AND fecha = ? AND hora = ? AND estado <> 'Cancelada'", [$t['id'], $fecha, $horaSql])->fetchColumn())
+responder(false, '❌ ' . $t['nombre'] . ' ya tiene una cita a esa hora. Elige otra.');
+
+// Guardar o actualizar datos personales
+$p = mi_paciente($u);
+$datos = [$f['documento'], $f['nombre'], $f['fechaNac'], $f['telefono'], $f['correo'] ?? '', $f['ciudad'] ?? ''];
+if ($p) {
+if (q("SELECT COUNT(*) FROM citas WHERE id_paciente = ? AND fecha = ? AND hora = ? AND estado <> 'Cancelada'", [$p['id'], $fecha, $horaSql])->fetchColumn())
+responder(false, 'Ya tienes otra cita ese día a esa misma hora.');
+q("UPDATE pacientes SET documento = ?, nombre = ?, fecha_nacimiento = ?, telefono = ?, correo = ?, ciudad = ? WHERE id = ?", array_merge($datos, [$p['id']]));
+$idP = $p['id'];
+} else {
+q("INSERT INTO pacientes (documento, nombre, fecha_nacimiento, telefono, correo, ciudad, id_usuario) VALUES (?, ?, ?, ?, ?, ?, ?)", array_merge($datos, [$u['id']]));
+$idP = $db->lastInsertId();
+}
+
+q("INSERT INTO citas (id_paciente, id_terapeuta, fecha, hora, modalidad, motivo, estado, creado_en) VALUES (?, ?, ?, ?, ?, ?, 'Pendiente', ?)",
+[$idP, $t['id'], $fecha, $horaSql, $f['modalidad'], mb_substr($f['motivo'] ?? '', 0, 255), ahora()]);
+registrar('Cita agendada', "{$f['nombre']} con {$t['nombre']} ({$f['modalidad']}) el $fecha $hora");
+responder(true, "✅ Cita agendada con {$t['nombre']}. Queda Pendiente hasta que el terapeuta la confirme.");
+}
+
+// ---------- Paciente: cancelar su cita ----------
+case 'cancelar_cita': {
+$u = requerir('paciente');
+$p = mi_paciente($u);
+$st = q("UPDATE citas SET estado = 'Cancelada' WHERE id = ? AND id_paciente = ? AND estado IN ('Pendiente','Confirmada')",
+[(int)($entrada['id'] ?? 0), $p ? $p['id'] : 0]);
+if (!$st->rowCount()) responder(false, 'No se pudo cancelar esa cita.');
+registrar('Cita cancelada por paciente', 'Cita #' . (int)$entrada['id']);
+responder(true, 'Cita cancelada.');
+}
+
+// ---------- Terapeuta o administrador: cambiar estado ----------
+case 'cambiar_estado': {
+$u = usuario_actual();
+if (!$u || !in_array($u['rol'], ['admin', 'terapeuta'], true)) responder(false, 'No tienes permiso.');
+$u = requerir($u['rol']);
+$estado = $entrada['estado'] ?? '';
+$c = q("SELECT c.*, p.nombre AS paciente FROM citas c JOIN pacientes p ON c.id_paciente = p.id WHERE c.id = ?", [(int)($entrada['id'] ?? 0)])->fetch();
+if (!$c || !in_array($estado, ESTADOS, true)) responder(false, 'No se pudo cambiar la cita.');
+if ($u['rol'] === 'terapeuta') {
+$t = mi_terapeuta($u);
+if (!$t || (int)$t['id'] !== (int)$c['id_terapeuta']) responder(false, 'Esa cita no es tuya.');
+}
+$enlace = $c['enlace_virtual'];
+if ($estado === 'Confirmada' && $c['modalidad'] === 'Virtual' && !$enlace) $enlace = crear_enlace_virtual();
+q("UPDATE citas SET estado = ?, enlace_virtual = ? WHERE id = ?", [$estado, $enlace, $c['id']]);
+registrar("Cita $estado", "Cita #{$c['id']} de {$c['paciente']} ({$c['fecha']} " . substr($c['hora'], 0, 5) . ")");
+responder(true, "La cita quedó como: $estado.");
+}
+
+// ---------- Terapeuta: nota de sesión ----------
+case 'nota': {
+$u = requerir('terapeuta');
+$t = mi_terapeuta($u);
+$idP = (int)($entrada['idPaciente'] ?? 0);
+$nota = $entrada['nota'] ?? '';
+if ($nota === '') responder(false, 'Escribe la nota.');
+if (!$t || !q("SELECT COUNT(*) FROM citas WHERE id_paciente = ? AND id_terapeuta = ?", [$idP, $t['id']])->fetchColumn())
+responder(false, 'Ese paciente no tiene citas contigo.');
+q("INSERT INTO notas (id_paciente, id_terapeuta, nota, creado_en) VALUES (?, ?, ?, ?)", [$idP, $t['id'], $nota, ahora()]);
+registrar('Nota de sesión', "Paciente #$idP");
+responder(true, 'Nota guardada.');
+}
+
+// ---------- Terapeuta: editar su perfil ----------
+case 'perfil': {
+$u = requerir('terapeuta');
+$t = mi_terapeuta($u);
+$f = $entrada;
+if (!$t) responder(false, 'Tu usuario no está vinculado a un terapeuta.');
+if (empty($f['titulo']) || empty($f['enfoque']) || empty($f['sede']) || empty($f['descripcion'])) responder(false, 'Completa todos los campos del perfil.');
+$mod = in_array($f['modalidad'] ?? '', MODALIDADES_TERAPEUTA, true) ? $f['modalidad'] : 'Ambas';
+q("UPDATE terapeutas SET titulo = ?, enfoque = ?, descripcion = ?, anos_experiencia = ?, modalidad = ?, sede = ? WHERE id = ?",
+[$f['titulo'], $f['enfoque'], $f['descripcion'], max(0, (int)($f['anos'] ?? 0)), $mod, $f['sede'], $t['id']]);
+registrar('Perfil actualizado', $t['nombre']);
+responder(true, 'Tu perfil se actualizó. Así lo verán los pacientes en la página principal.');
+}
+
+// ---------- Administrador: crear o editar terapeuta ----------
+case 'guardar_terapeuta': {
+requerir('admin');
+$f = $entrada;
+$id = (int)($f['id'] ?? 0);
+$te = $id ? q("SELECT * FROM terapeutas WHERE id = ?", [$id])->fetch() : null;
+$otro = q("SELECT id FROM usuarios WHERE correo = ?", [$f['correo'] ?? ''])->fetchColumn();
+$clave = $f['clave'] ?? '';
+if (empty($f['nombre']) || !filter_var($f['correo'] ?? '', FILTER_VALIDATE_EMAIL) || empty($f['titulo']) || empty($f['sede']))
+responder(false, 'Completa nombre, correo válido, título y sede.');
+if ($otro && (!$te || (int)$otro !== (int)$te['id_usuario'])) responder(false, 'Ese correo ya lo usa otra cuenta.');
+if (!$te && strlen($clave) < 6) responder(false, 'La contraseña inicial debe tener mínimo 6 caracteres.');
+$mod = in_array($f['modalidad'] ?? '', MODALIDADES_TERAPEUTA, true) ? $f['modalidad'] : 'Ambas';
+$datos = [(int)$f['idEsp'], $f['nombre'], $f['titulo'], $f['enfoque'] ?? '', $f['descripcion'] ?? '', max(0, (int)($f['anos'] ?? 0)), $mod, $f['sede']];
+
+if ($te) {
+q("UPDATE terapeutas SET id_especialidad = ?, nombre = ?, titulo = ?, enfoque = ?, descripcion = ?, anos_experiencia = ?, modalidad = ?, sede = ? WHERE id = ?",
+array_merge($datos, [$id]));
+if ($te['id_usuario']) {
+q("UPDATE usuarios SET nombre = ?, correo = ? WHERE id = ?", [$f['nombre'], $f['correo'], $te['id_usuario']]);
+if (strlen($clave) >= 6) q("UPDATE usuarios SET contrasena = ? WHERE id = ?", [password_hash($clave, PASSWORD_DEFAULT), $te['id_usuario']]);
+}
+registrar('Terapeuta editado', $f['nombre']);
+responder(true, 'Terapeuta actualizado.');
+}
+q("INSERT INTO usuarios (nombre, correo, contrasena, rol, activo, creado_en) VALUES (?, ?, ?, 'terapeuta', 1, ?)",
+[$f['nombre'], $f['correo'], password_hash($clave, PASSWORD_DEFAULT), ahora()]);
+$idU = $db->lastInsertId();
+q("INSERT INTO terapeutas (id_especialidad, nombre, titulo, enfoque, descripcion, anos_experiencia, modalidad, sede, id_usuario, activo)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)", array_merge($datos, [$idU]));
+registrar('Terapeuta creado', $f['nombre']);
+responder(true, "Terapeuta creado. Ya puede entrar con {$f['correo']}.");
+}
+
+// ---------- Administrador: activar / desactivar terapeuta ----------
+case 'activar_terapeuta': {
+requerir('admin');
+$t = q("SELECT * FROM terapeutas WHERE id = ?", [(int)($entrada['id'] ?? 0)])->fetch();
+if (!$t) responder(false, 'Ese terapeuta no existe.');
+$nuevo = $t['activo'] ? 0 : 1;
+q("UPDATE terapeutas SET activo = ? WHERE id = ?", [$nuevo, $t['id']]);
+if ($t['id_usuario']) q("UPDATE usuarios SET activo = ? WHERE id = ?", [$nuevo, $t['id_usuario']]);
+registrar($nuevo ? 'Terapeuta activado' : 'Terapeuta desactivado', $t['nombre']);
+responder(true, $t['nombre'] . ($nuevo ? ' ahora aparece en la página.' : ' ya no aparece en la página ni puede entrar.'));
+}
+
+// ---------- Administrador: activar / desactivar usuario ----------
+case 'activar_usuario': {
+$u = requerir('admin');
+$id = (int)($entrada['id'] ?? 0);
+if ($id === $u['id']) responder(false, 'No puedes desactivar tu propia cuenta.');
+$x = q("SELECT nombre, activo FROM usuarios WHERE id = ?", [$id])->fetch();
+if (!$x) responder(false, 'Ese usuario no existe.');
+$nuevo = $x['activo'] ? 0 : 1;
+q("UPDATE usuarios SET activo = ? WHERE id = ?", [$nuevo, $id]);
+q("UPDATE terapeutas SET activo = ? WHERE id_usuario = ?", [$nuevo, $id]);
+registrar($nuevo ? 'Usuario activado' : 'Usuario desactivado', $x['nombre']);
+responder(true, 'Usuario actualizado.');
+}
+
+// ---------- Administrador: contraseña temporal ----------
+case 'clave_usuario': {
+requerir('admin');
+$id = (int)($entrada['id'] ?? 0);
+$nombre = q("SELECT nombre FROM usuarios WHERE id = ?", [$id])->fetchColumn();
+if (!$nombre) responder(false, 'Ese usuario no existe.');
+$temporal = 'Tp' . random_int(100000, 999999);
+q("UPDATE usuarios SET contrasena = ? WHERE id = ?", [password_hash($temporal, PASSWORD_DEFAULT), $id]);
+registrar('Contraseña restablecida', $nombre);
+responder(true, "Nueva contraseña temporal de $nombre: $temporal (compártela con la persona).");
+}
+
+default:
+responder(false, 'Acción no válida.');
+}
+
+
